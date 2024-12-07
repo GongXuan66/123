@@ -1,0 +1,514 @@
+# 使用官方MySQL镜像
+FROM mysql:latest
+
+# 设置环境变量
+ENV MYSQL_ROOT_PASSWORD 123456
+ENV MYSQL_DATABASE task
+
+# 将初始化数据库的SQL脚本复制到容器中
+COPY init.sql /docker-entrypoint-initdb.d/
+package main
+
+
+
+
+
+import (
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"log"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+// User 用户模型
+type User struct {
+	ID       uint   `gorm:"primaryKey"`
+	Username string `gorm:"unique;not null"`
+	Password string `gorm:"not null"`
+	Role     string `gorm:"default:user"` // user 或 admin
+	Profile  string `gorm:"type:text"`
+}
+
+// Team 组队模型
+type Team struct {
+	ID                  uint   `gorm:"primaryKey"`
+	Name                string `gorm:"not null"`
+	Purpose             string `gorm:"type:text"`
+	Time                string `gorm:"not null"` // 你可以使用其他格式，如 time.Time
+	Location            string `gorm:"not null"`
+	MaxMembers          int    `gorm:"not null"`
+	SpecialRequirements string `gorm:"type:text"`
+	CreatedBy           uint   `gorm:"not null"` // 创建者的用户ID
+	Status              string `gorm:"status"`   // 审核状态: "待审核", "通过", "不通过"
+}
+
+// TeamMember 团队成员模型
+type TeamMember struct {
+	ID     uint `gorm:"primaryKey"`
+	TeamID uint // 所属团队 ID
+	UserID uint // 成员用户 ID
+}
+
+// JoinRequest 加入申请模型
+type JoinRequest struct {
+	ID        uint   `gorm:"primaryKey"`
+	TeamID    uint   // 所属团队 ID
+	UserID    uint   // 申请的用户 ID
+	Reason    string // 申请理由
+	Advantage string `gorm:"type:text"` //优势
+}
+
+// Message 私信模型
+type Message struct {
+	ID         uint      `gorm:"primaryKey"`
+	SenderID   uint      // 发送者用户 ID
+	ReceiverID uint      // 接收者用户 ID
+	Content    string    `gorm:"type:text;not null"` // 消息内容
+	Timestamp  time.Time `gorm:"autoCreateTime"`     // 消息发送时间
+}
+
+var db *gorm.DB
+
+// 从字符串转换为uint的辅助函数
+func convertToUint(idStr string) (uint, error) {
+	id, err := strconv.ParseUint(idStr, 10, 32) // 将字符串转换为uint64
+	if err != nil {
+		return 0, err // 转换失败，返回错误
+	}
+	return uint(id), nil
+}
+
+// 初始化数据库
+func initDatabase() {
+	var err error
+	dsn := "root:123456@tcp(127.0.0.1:3306)/task?charset=utf8mb4&parseTime=True&loc=Local"
+	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatal("failed to connect to database")
+	}
+	db.AutoMigrate(&User{}, &Team{}, &TeamMember{}, &JoinRequest{}, &Message{}) // 自动迁移，创建用户表
+}
+
+// 注册
+func register(c *gin.Context) {
+	var user User
+	if err := c.ShouldBindJSON(&user); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+
+	// 校验用户名和密码
+	if user.Username == "" || user.Password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名和密码不能为空"})
+		return
+	}
+
+	// 加密密码
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "密码加密失败"})
+		return
+	}
+	user.Password = string(hashedPassword)
+
+	// 保存用户到数据库
+	if err := db.Create(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户注册失败"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "用户注册成功", "id": user.ID})
+}
+
+// 登录
+func login(c *gin.Context) {
+	var user User
+	var input User
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+
+	// 查找用户
+	if err := db.First(&user, "username = ?", input.Username).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户不存在"})
+		return
+	}
+
+	// 验证密码
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "密码错误"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "登录成功", "user": user.Username})
+}
+
+// 判断是否为管理员
+func isAdmin(idStr string) bool {
+	userID := idStr // 从路由参数获取用户ID
+
+	var user User
+	// 查询用户的角色
+	if err := db.First(&user, userID).Error; err != nil {
+		return false // 如果查询失败，返回false
+	}
+
+	return user.Role == "admin" // 检查用户角色是否为管理员
+}
+
+// 发布组队信息的处理函数
+func createTeam(c *gin.Context) {
+	var team Team
+	if err := c.ShouldBindJSON(&team); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+
+	// 校验所有必填字段
+	if team.Name == "" || team.Time == "" || team.Location == "" || team.MaxMembers <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少必填字段"})
+		return
+	}
+
+	// 获取当前用户的ID
+	userIDStr := c.Param("userID") // 从路由参数获取用户ID
+
+	userID, err := convertToUint(userIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的用户ID"})
+		return
+	}
+	team.CreatedBy = userID
+	team.Status = "待审核" // 设置状态为待审核
+
+	// 保存团队到数据库
+	if err := db.Create(&team).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "组队信息创建失败"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "组队信息创建成功，待管理员审核"})
+}
+
+// 管理员审核
+func reviewTeam(c *gin.Context) {
+	userIDStr := c.Param("userID")
+	var input struct {
+		TeamID uint   `json:"team_id"`
+		Status string `json:"status"` // 期望的审核结果: "通过" 或 "不通过"
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+
+	// 检查用户是否为管理员
+	if !isAdmin(userIDStr) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "只有管理员可以进行审核"})
+		return
+	}
+
+	var team Team
+	if err := db.First(&team, input.TeamID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "队伍不存在"})
+		return
+	}
+
+	// 更新队伍状态
+	team.Status = input.Status
+	if input.Status == "通过" {
+		// 如果被接受，可以执行其他逻辑，例如通知用户等
+	}
+
+	if err := db.Save(&team).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新队伍状态失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "审核状态已更新"})
+}
+
+// 获取待审核的队伍申请
+func getPendingTeams(c *gin.Context) {
+	userIDStr := c.Param("userID") // 从路由参数获取用户ID
+	// 检查当前用户是否为管理员
+	if !isAdmin(userIDStr) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "只有管理员可以查看申请"})
+		return
+	}
+
+	var teams []Team
+	// 查询所有状态为 "pending" 的队伍申请
+	if err := db.Where("status = ?", "待审核").Find(&teams).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取待审核队伍失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, teams) // 返回待审核的队伍申请列表
+}
+
+// 获取组队信息的处理函数
+func getTeams(c *gin.Context) {
+	var teams []Team
+
+	// 查询数据库中的所有组队信息
+	if err := db.Find(&teams).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取组队信息失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, teams)
+}
+
+// 申请加入团队的处理函数
+func applyToJoinTeam(c *gin.Context) {
+	var joinRequest JoinRequest
+	if err := c.ShouldBindJSON(&joinRequest); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+
+	// 保存申请到数据库
+	if err := db.Create(&joinRequest).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "申请提交失败"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "申请提交成功"})
+}
+
+// 获取团队成员的处理函数
+func getTeamMembers(c *gin.Context) {
+	teamID := c.Param("teamID")
+	userIDStr := c.Param("userID") // 从路由参数获取用户ID
+
+	userID, err := convertToUint(userIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的用户ID"})
+		return
+	}
+
+	var team Team
+
+	// 查找团队
+	if err := db.First(&team, teamID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "团队不存在"})
+		return
+	}
+
+	// 检查当前用户是否是队长
+	if team.CreatedBy != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "只有队长可以查看队员信息"})
+		return
+	}
+
+	// 查询团队所有成员
+	var members []User
+	if err := db.Table("users").Joins("JOIN team_members ON users.id = team_members.user_id").Where("team_members.team_id = ?", team.ID).Find(&members).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取队员信息失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, members)
+}
+
+// 审核加入申请的处理函数
+func reviewJoinRequest(c *gin.Context) {
+	var request JoinRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+
+	userIDStr := c.Param("userID") // 从路由参数获取用户ID
+
+	userID, err := convertToUint(userIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的用户ID"})
+		return
+	}
+
+	var team Team
+	if err := db.First(&team, request.TeamID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "团队未找到"})
+		return
+	}
+
+	if team.CreatedBy != userID { // 验证队长身份
+		c.JSON(http.StatusForbidden, gin.H{"error": "您没有权限审核此申请"})
+		return
+	}
+
+	// 将申请加入的用户添加为团队成员
+	teamMember := TeamMember{TeamID: request.TeamID, UserID: request.UserID}
+	if err := db.Create(&teamMember).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "添加成员失败"})
+		return
+	}
+
+	// 删除申请记录
+	if err := db.Delete(&request).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除申请失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "申请已批准并成功添加为成员"})
+}
+
+// 搜索组队信息的处理函数
+func searchTeams(c *gin.Context) {
+	name := c.Query("name")         // 从查询参数中获取组队名称
+	purpose := c.Query("purpose")   // 获取组队目的
+	location := c.Query("location") // 获取地点
+
+	var teams []Team
+	query := db.Model(&Team{})
+
+	// 根据条件构建查询
+	if name != "" {
+		query = query.Where("name LIKE ?", "%"+name+"%")
+	}
+	if purpose != "" {
+		query = query.Where("purpose LIKE ?", "%"+purpose+"%")
+	}
+	if location != "" {
+		query = query.Where("location LIKE ?", "%"+location+"%")
+	}
+
+	// 执行查询
+	if err := query.Find(&teams).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "搜索失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, teams)
+}
+
+// 发送私信的处理函数
+func sendMessage(c *gin.Context) {
+	var message Message
+	if err := c.ShouldBindJSON(&message); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+
+	userIDStr := c.Param("userID") // 从路由参数获取用户ID
+
+	userID, err := convertToUint(userIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的用户ID"})
+		return
+	}
+	message.SenderID = userID
+
+	// 保存消息到数据库
+	if err := db.Create(&message).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "发送消息失败"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "消息发送成功"})
+}
+
+// 获取用户私信的处理函数
+func getMessages(c *gin.Context) {
+	userID := c.Param("userID")
+
+	var messages []Message
+
+	// 查询接收者为当前用户的私信
+	if err := db.Where("receiver_id = ?", userID).Find(&messages).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取私信失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, messages)
+}
+
+//// 从token中获取用户ID
+//func getUserIDFromToken(c *gin.Context) (uint, error) {
+//	tokenString := c.Request.Header.Get("Authorization")
+//	if tokenString == "" {
+//		return 0, errors.New("缺少令牌")
+//	}
+//
+//	tokenString = tokenString[len("Bearer "):] // 解析Bearer token
+//	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+//		return jwtSecret, nil
+//	})
+//
+//	if err != nil {
+//		// 这里添加日志输出错误
+//		log.Printf("解析JWT令牌时出错: %v", err)
+//		return 0, err
+//	}
+//
+//	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+//		userID := uint(claims["id"].(float64)) // 转换为uint
+//		// 这里添加日志输出用户ID
+//		log.Printf("从JWT令牌中提取的用户ID: %v", userID)
+//		return userID, nil
+//	} else {
+//		// 这里添加日志输出错误
+//		log.Printf("JWT令牌无效或过期: %v", err)
+//		return 0, err
+//	}
+//}
+
+// GenerateJWT 生成JWT
+//func GenerateJWT(user User) (string, error) {
+//claims := jwt.MapClaims{
+//"id":   user.ID,
+//"role": user.Role,
+//"exp":  time.Now().Add(time.Hour * 72).Unix(), // 过期时间
+//}
+//token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+//return token.SignedString(jwtSecret)
+//}
+
+// 生成JWT
+//token, err := GenerateJWT(user)
+//if err != nil {
+//c.JSON(http.StatusInternalServerError, gin.H{"error": "生成token失败"})
+//return
+//}
+
+// 启动服务
+func main() {
+	initDatabase()
+	r := gin.Default()
+
+	// 用户注册和登录接口
+	r.POST("/register", register)
+	r.POST("/login", login)
+
+	// 组队信息发布与管理接口
+	r.POST("/teams/:userID", createTeam)                  // 组队创建时传递用户ID
+	r.PUT("/admin/teams/review:userID", reviewTeam)       // 管理员审核团队申请
+	r.GET("/admin/teams/pending:userID", getPendingTeams) // 管理员获取待审核队伍申请
+	r.GET("/teams", getTeams)
+
+	// 申请加入团队
+	r.POST("/teams/join", applyToJoinTeam) // 申请加入团队时传递用户ID
+	// 获取团队成员
+	r.GET("/teams/:teamID/members/:userID", getTeamMembers) // 获取团队成员时传递用户ID
+	// 审核加入申请
+	r.PUT("/teams/join-request/:userID", reviewJoinRequest) // 审核加入申请时传递用户ID
+
+	// 搜索组队信息
+	r.GET("/teams/search", searchTeams)
+	// 发送私信
+	r.POST("/messages/:userID", sendMessage)
+	// 获取私信
+	r.GET("/messages/:userID", getMessages)
+
+	// 启动服务
+	r.Run(":8080")
+}
